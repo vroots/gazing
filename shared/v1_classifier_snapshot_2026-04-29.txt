@@ -1,0 +1,286 @@
+# Snapshot of v1 buildClassificationPrompt() functions
+# Date: 2026-04-29
+# Source: production app (private)
+# Status: V1 — will be replaced by V3 architecture
+# Purpose: reference only, not target format
+
+// =============================================================
+// EXPORT: 3 functions from production classifier service
+// Read at: 2026-04-29 (no source modifications)
+// Source: production classifier service
+// =============================================================
+
+// -------------------------------------------------------------
+// 1. prepareProductText (lines 7-30)
+// -------------------------------------------------------------
+export function prepareProductText(title: string, description: string = "") {
+  const cleanTitle = title
+    .replace(/<[^>]*>/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+
+  const cleanDesc = description
+    .replace(/<[^>]*>/g, "")
+    .replace(/&[a-z]+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 600);
+
+  if (description.length > 600) {
+    console.warn("[TRUNCATED]", {
+      productTitle: cleanTitle,
+      originalDescLength: description.length,
+      truncatedTo: 600,
+    });
+  }
+
+  return { cleanTitle, cleanDesc };
+}
+
+// -------------------------------------------------------------
+// 2. extractMaterials (lines 36-74; depends on MATERIAL_PATTERNS const above)
+// -------------------------------------------------------------
+const MATERIAL_PATTERNS = [
+  { pattern: /(\d+)%\s*(cotton|polyester|nylon|wool|silk|linen|rayon|spandex|lycra|acrylic)/gi, type: "fiber" },
+  { pattern: /\b(genuine|real|faux|vegan|synthetic)\s*(leather|suede|nubuck)/gi, type: "leather" },
+  { pattern: /\b(solid|sterling|925|14k|18k|24k)\s*(silver|gold|platinum)/gi, type: "metal" },
+  { pattern: /\b(stainless steel|aluminum|aluminium|carbon fiber|fiberglass|ABS|polypropylene|polycarbonate)\b/gi, type: "material" },
+  { pattern: /\b(wood|wooden|bamboo|rattan|wicker|oak|pine|walnut|teak)\b/gi, type: "wood" },
+  { pattern: /\b(glass|ceramic|porcelain|silicone|rubber|latex)\b/gi, type: "material" },
+];
+
+export function extractMaterials(title: string, desc: string): {
+  materials: Array<{ material: string; percentage?: number; type: string }>;
+  primaryMaterial: string | null;
+} {
+  const text = title + " " + (desc || "");
+  const found: Array<{ material: string; percentage?: number; type: string }> = [];
+
+  for (const { pattern, type } of MATERIAL_PATTERNS) {
+    const regex = new RegExp(pattern.source, pattern.flags);
+    const matches = [...text.matchAll(regex)];
+    for (const match of matches) {
+      found.push({
+        material: match[2] || match[1] || match[0],
+        percentage: match[1] && !isNaN(Number(match[1])) ? Number(match[1]) : undefined,
+        type,
+      });
+    }
+  }
+
+  const withPct = found.filter((m) => m.percentage);
+  const primaryMaterial = withPct.length > 0
+    ? withPct.sort((a, b) => (b.percentage || 0) - (a.percentage || 0))[0].material
+    : found[0]?.material || null;
+
+  if (found.length > 0) {
+    console.log("[MATERIALS]", { product: title.slice(0, 50), extracted: found, primary: primaryMaterial });
+  }
+
+  return { materials: found, primaryMaterial };
+}
+
+// -------------------------------------------------------------
+// 3. buildClassificationPrompt (lines 292-431)
+// -------------------------------------------------------------
+export function buildClassificationPrompt(
+  mode: string,
+  productTitle: string,
+  productDescription: string,
+  productType: string,
+  vendor: string,
+  materials?: { materials: Array<{ material: string; percentage?: number; type: string }>; primaryMaterial: string | null },
+  productTypeHints?: { likelyChapter: string | null; warning: string | null; hints: string[] },
+  ragExamples?: Array<{ productTitle: string; correctedHsCode: string; score: number }>,
+): string {
+  let contextBlock = "";
+
+  // Material context
+  if (materials && materials.materials.length > 0) {
+    contextBlock += `\nExtracted product attributes:\nMaterials detected: ${materials.materials.map((m) => (m.percentage ? `${m.percentage}% ${m.material}` : m.material)).join(", ")}\nPrimary material: ${materials.primaryMaterial}\n`;
+  }
+
+  // Product type hints
+  if (productTypeHints && productTypeHints.likelyChapter) {
+    contextBlock += `\nProduct type detection: Likely Chapter ${productTypeHints.likelyChapter}\n${productTypeHints.hints.map((h) => `- ${h}`).join("\n")}\n`;
+    if (productTypeHints.warning) {
+      contextBlock += `Common error to avoid: ${productTypeHints.warning}\n`;
+    }
+  }
+
+  // RAG examples
+  if (ragExamples && ragExamples.length > 0) {
+    contextBlock += `\nReference classifications from verified merchant data:\n${ragExamples.map((s) => `"${s.productTitle}" -> ${s.correctedHsCode} (${Math.round(s.score * 100)}% similar)`).join("\n")}\nUse these as reference points. If your classification matches these examples, confidence should be higher.\n`;
+  }
+
+  const productInfo = `${contextBlock}
+Product title: ${productTitle}
+Key details: ${productDescription || "No description provided"}
+Type: ${productType || "Not specified"}
+Vendor: ${vendor || "Not specified"}
+
+Classify using ALL the context above. Focus on:
+material, construction method, primary function,
+target user (men/women/children/unisex), and any
+technical specifications that affect the classification.`;
+
+  if (mode === "ca_only") {
+    return `You are a Canadian customs classification expert applying GRI (General Rules of Interpretation) methodology. Classify this product with a 10-digit Canadian HS code.
+
+${productInfo}
+
+Return ONLY valid JSON with no other text:
+{
+  "hs_code": "1234567890",
+  "us_hts_code": "",
+  "chapter": "12",
+  "category": "Short product category",
+  "confidence": 0.92,
+  "reasoning": "2-3 sentence explanation referencing GRI rules and product characteristics.",
+  "rules_applied": ["GRI 1", "GRI 6"],
+  "alternatives": [{"hs_code": "1234560000", "confidence": 0.65, "reason": "Brief reason"}],
+  "suggestions": [
+    {"ca_code": "1234560020", "us_code": "", "description": "Alt description", "ca_duty_rate": "18%", "us_duty_rate": "", "confidence": 0.74, "reason": "Why this"},
+    {"ca_code": "1110200092", "us_code": "", "description": "Another alt", "ca_duty_rate": "18%", "us_duty_rate": "", "confidence": 0.61, "reason": "Why this"},
+    {"ca_code": "1109902000", "us_code": "", "description": "Third alt", "ca_duty_rate": "18%", "us_duty_rate": "", "confidence": 0.41, "reason": "Why this"}
+  ]
+}`;
+  }
+
+  if (mode === "us_only") {
+    return `You are a US customs classification expert applying GRI methodology. Classify this product with a 10-digit US HTS code.
+
+${productInfo}
+
+Return ONLY valid JSON with no other text:
+{
+  "hs_code": "",
+  "us_hts_code": "1234567890",
+  "chapter": "12",
+  "category": "Short product category",
+  "confidence": 0.91,
+  "reasoning": "2-3 sentence explanation referencing GRI rules.",
+  "rules_applied": ["GRI 1", "GRI 6"],
+  "alternatives": [{"hs_code": "1234560000", "confidence": 0.65, "reason": "Brief reason"}],
+  "suggestions": [
+    {"ca_code": "", "us_code": "1234560020", "description": "Alt description", "ca_duty_rate": "", "us_duty_rate": "16.5%", "confidence": 0.74, "reason": "Why this"},
+    {"ca_code": "", "us_code": "1110200010", "description": "Another alt", "ca_duty_rate": "", "us_duty_rate": "16.5%", "confidence": 0.61, "reason": "Why this"},
+    {"ca_code": "", "us_code": "1109901070", "description": "Third alt", "ca_duty_rate": "", "us_duty_rate": "15%", "confidence": 0.41, "reason": "Why this"}
+  ]
+}`;
+  }
+
+  if (mode === "all") {
+    return `You are an international customs classification expert applying GRI methodology. Classify this product with ALL THREE codes: a 10-digit Canadian HS code, a 10-digit US HTS code, AND a 13-digit Chinese HS code.
+
+${productInfo}
+
+Return ONLY valid JSON with no other text:
+{
+  "hs_code": "1234567890",
+  "us_hts_code": "1234567890",
+  "cn_hs_code": "1234567890123",
+  "chapter": "12",
+  "category": "Short product category",
+  "confidence": 0.90,
+  "reasoning": "2-3 sentence explanation. Note any differences between CA, US, and CN codes.",
+  "rules_applied": ["GRI 1", "GRI 6"],
+  "alternatives": [{"hs_code": "1234560000", "confidence": 0.65, "reason": "Brief reason"}],
+  "suggestions": [
+    {"ca_code": "1234560020", "us_code": "1234560020", "cn_code": "1234560020000", "description": "Alt description", "ca_duty_rate": "18%", "us_duty_rate": "16.5%", "cn_duty_rate": "12%", "confidence": 0.74, "reason": "Why this"},
+    {"ca_code": "1110200092", "us_code": "1110200010", "cn_code": "1110200010000", "description": "Another alt", "ca_duty_rate": "18%", "us_duty_rate": "16.5%", "cn_duty_rate": "10%", "confidence": 0.61, "reason": "Why this"},
+    {"ca_code": "1109902000", "us_code": "1109901070", "cn_code": "1109902000000", "description": "Third alt", "ca_duty_rate": "18%", "us_duty_rate": "15%", "cn_duty_rate": "8%", "confidence": 0.41, "reason": "Why this"}
+  ]
+}
+
+Guidelines:
+- hs_code: 10-digit Canadian HS code
+- us_hts_code: 10-digit US HTS code
+- cn_hs_code: 13-digit Chinese HS code (6 international + 2 national subheading + 2 supervisory + 3 inspection/quarantine)
+- First 6 digits are usually identical across all 3 countries
+- suggestions: exactly 3 genuinely different codes with all 3 country codes`;
+  }
+
+  // mode === "both" (default)
+  return `You are an international customs classification expert applying GRI methodology. Classify this product with BOTH a 10-digit Canadian HS code AND a 10-digit US HTS code.
+
+${productInfo}
+
+Return ONLY valid JSON with no other text:
+{
+  "hs_code": "1234567890",
+  "us_hts_code": "1234567890",
+  "chapter": "12",
+  "category": "Short product category",
+  "confidence": 0.92,
+  "reasoning": "2-3 sentence explanation. Note any CA/US code differences.",
+  "rules_applied": ["GRI 1", "GRI 6"],
+  "alternatives": [{"hs_code": "1234560000", "confidence": 0.65, "reason": "Brief reason"}],
+  "suggestions": [
+    {"ca_code": "1234560020", "us_code": "1234560020", "description": "Alt description", "ca_duty_rate": "18%", "us_duty_rate": "16.5%", "confidence": 0.74, "reason": "Why this"},
+    {"ca_code": "1110200092", "us_code": "1110200010", "description": "Another alt", "ca_duty_rate": "18%", "us_duty_rate": "16.5%", "confidence": 0.61, "reason": "Why this"},
+    {"ca_code": "1109902000", "us_code": "1109901070", "description": "Third alt", "ca_duty_rate": "18%", "us_duty_rate": "15%", "confidence": 0.41, "reason": "Why this"}
+  ]
+}`;
+}
+
+
+// =============================================================
+// SAMPLE CALL OUTPUT
+// Inputs:
+//   title = "Cotton T-Shirt Crew Neck Short Sleeve Mens"
+//   description = "Premium 100% cotton crew neck t-shirt. Machine washable."
+//   countryOfOrigin = "CN"  (NOT a parameter of buildClassificationPrompt — see note below)
+// =============================================================
+
+=== INPUTS (after prepareProductText) ===
+cleanTitle: "Cotton T-Shirt Crew Neck Short Sleeve Mens"
+cleanDesc:  "Premium 100% cotton crew neck t-shirt. Machine washable."
+
+=== extractMaterials() OUTPUT ===
+{
+  "materials": [
+    {
+      "material": "cotton",
+      "percentage": 100,
+      "type": "fiber"
+    }
+  ],
+  "primaryMaterial": "cotton"
+}
+
+=== buildClassificationPrompt(mode='both') OUTPUT ===
+You are an international customs classification expert applying GRI methodology. Classify this product with BOTH a 10-digit Canadian HS code AND a 10-digit US HTS code.
+
+
+Extracted product attributes:
+Materials detected: 100% cotton
+Primary material: cotton
+
+Product title: Cotton T-Shirt Crew Neck Short Sleeve Mens
+Key details: Premium 100% cotton crew neck t-shirt. Machine washable.
+Type: Not specified
+Vendor: Not specified
+
+Classify using ALL the context above. Focus on:
+material, construction method, primary function,
+target user (men/women/children/unisex), and any
+technical specifications that affect the classification.
+
+Return ONLY valid JSON with no other text:
+{
+  "hs_code": "1234567890",
+  "us_hts_code": "1234567890",
+  "chapter": "12",
+  "category": "Short product category",
+  "confidence": 0.92,
+  "reasoning": "2-3 sentence explanation. Note any CA/US code differences.",
+  "rules_applied": ["GRI 1", "GRI 6"],
+  "alternatives": [{"hs_code": "1234560000", "confidence": 0.65, "reason": "Brief reason"}],
+  "suggestions": [
+    {"ca_code": "1234560020", "us_code": "1234560020", "description": "Alt description", "ca_duty_rate": "18%", "us_duty_rate": "16.5%", "confidence": 0.74, "reason": "Why this"},
+    {"ca_code": "1110200092", "us_code": "1110200010", "description": "Another alt", "ca_duty_rate": "18%", "us_duty_rate": "16.5%", "confidence": 0.61, "reason": "Why this"},
+    {"ca_code": "1109902000", "us_code": "1109901070", "description": "Third alt", "ca_duty_rate": "18%", "us_duty_rate": "15%", "confidence": 0.41, "reason": "Why this"}
+  ]
+}
